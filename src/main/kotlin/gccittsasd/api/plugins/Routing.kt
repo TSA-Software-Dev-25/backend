@@ -1,0 +1,178 @@
+package gccittsasd.api.plugins
+
+import com.beust.klaxon.JsonObject
+import com.beust.klaxon.Klaxon
+import com.beust.klaxon.Parser
+import gccittsasd.api.sha256
+import io.github.cdimascio.dotenv.dotenv
+import io.ktor.client.HttpClient
+import io.ktor.client.call.*
+import io.ktor.client.engine.cio.CIO
+import io.ktor.client.request.bearerAuth
+import io.ktor.client.request.get
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.http.*
+import io.ktor.server.application.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import kotlinx.coroutines.runBlocking
+import java.net.URLEncoder
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
+import javax.crypto.Cipher
+import kotlin.time.TimeSource
+
+fun String.sha256(): String {
+    return return MessageDigest
+        .getInstance("SHA-256")
+        .digest(this.toByteArray())
+        .fold("") { str, it -> str + "%02x".format(it) }
+}
+
+fun Application.configureRouting() {
+    val uniqueIdentifications = mutableListOf<String>()
+    val activeIdentifications = mutableMapOf<String, List<Any>>()
+
+    val generator = KeyPairGenerator.getInstance("RSA")
+    generator.initialize(2048, SecureRandom())
+    val keyPair = generator.genKeyPair()
+    val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+    cipher.init(Cipher.DECRYPT_MODE, keyPair.private)
+
+    routing {
+        get("/key") {
+            call.respondText(Base64.getEncoder().encodeToString(keyPair.public.encoded), ContentType.parse("text/plain"))
+        }
+
+        post("accounts/create") {
+            val body: JsonObject
+            try {
+                val req = call.receive<String>()
+                println(req)
+                body = Parser.default().parse(StringBuilder(req)) as JsonObject
+                body.string("username")!!
+                body.string("password")!!
+            } catch (e: Error) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val username = body.string("username")!!
+            val plaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("password")!!))).split(":ID=")
+            val password = plaintext[0]
+            val identifier = plaintext[1]
+
+            if (uniqueIdentifications.contains(identifier)) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            } else {
+                uniqueIdentifications += identifier
+            }
+
+            var unique: Boolean? = null
+            runBlocking {
+                val res = HttpClient(CIO).get("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts?fields%5B%5D=Username&filterByFormula=%7BUsername%7D+%3D+'${URLEncoder.encode(username, "UTF-8")}'") {
+                    headers {
+                        bearerAuth(dotenv()["AIRTABLE_API_TOKEN"])
+                    }
+                }
+                val airtableCheckBody = Parser.default().parse(StringBuilder(res.body<String>())) as JsonObject
+                unique = airtableCheckBody.array<JsonObject>("records")?.none()
+            }
+            if (unique == null) {
+                call.respond(HttpStatusCode.InternalServerError)
+                return@post
+            } else if (!unique) {
+                call.respond(HttpStatusCode.Forbidden)
+                return@post
+            }
+
+            val record = mapOf(
+                "records" to listOf(
+                    mapOf(
+                        "fields" to mapOf(
+                            "Username" to username,
+                            "Password" to password
+                        )
+                    )
+                )
+            )
+
+            val status: Int
+            runBlocking {
+                val res = HttpClient(CIO).post("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts") {
+                    headers {
+                        bearerAuth(dotenv()["AIRTABLE_API_TOKEN"])
+                        contentType(ContentType.Application.Json)
+                    }
+                    setBody(Klaxon().toJsonString(record))
+                }
+                status = res.status.value
+            }
+            if (status == 200) call.respond(HttpStatusCode.OK)
+        }
+
+        post("accounts/login") {
+            val body: JsonObject
+            try {
+                val req = call.receive<String>()
+                println(req)
+                body = Parser.default().parse(StringBuilder(req)) as JsonObject
+                body.string("username")!!
+                body.string("password")!!
+                body.string("key")!!
+            } catch (e: Error) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val username = body.string("username")!!
+            val plaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("password")!!))).split(":ID=")
+            val password = plaintext[0]
+            val identifier = plaintext[1]
+            val key = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(body.string("key")!!)))
+
+            if (uniqueIdentifications.contains(identifier)) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            } else {
+                uniqueIdentifications += identifier
+            }
+
+            var correct: Boolean? = null
+            runBlocking {
+                val res = HttpClient(CIO).get("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts?fields=Username&fields=Password&filterByFormula=%7BUsername%7D+%3D+'${URLEncoder.encode(username, "UTF-8")}'") {
+                    headers {
+                        bearerAuth(dotenv()["AIRTABLE_API_TOKEN"])
+                    }
+                }
+                val airtableCheckBody = Parser.default().parse(StringBuilder(res.body<String>())) as JsonObject
+                correct = airtableCheckBody.array<JsonObject>("records")?.get(0)?.obj("fields")?.string("Password") == password
+            }
+            if (correct == null) {
+                call.respond(HttpStatusCode.Forbidden)
+                return@post
+            } else if (!correct) {
+                call.respond(HttpStatusCode.Forbidden)
+                return@post
+            }
+
+            val token = "${SecureRandom().nextFloat()}:${System.currentTimeMillis()}".sha256()
+            activeIdentifications += token to listOf(TimeSource.Monotonic.markNow(), username)
+
+            val encrypt = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+            encrypt.init(Cipher.ENCRYPT_MODE, key)
+            call.respondText(Base64.getEncoder().encodeToString(encrypt.doFinal(token.toByteArray())))
+        }
+
+        post("accounts/logout") {}
+
+        post("accounts/delete") {}
+    }
+}
