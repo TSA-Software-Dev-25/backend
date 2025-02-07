@@ -3,7 +3,6 @@ package gccittsasd.api.plugins
 import com.beust.klaxon.JsonObject
 import com.beust.klaxon.Klaxon
 import com.beust.klaxon.Parser
-import gccittsasd.api.sha256
 import io.github.cdimascio.dotenv.dotenv
 import io.ktor.client.HttpClient
 import io.ktor.client.call.*
