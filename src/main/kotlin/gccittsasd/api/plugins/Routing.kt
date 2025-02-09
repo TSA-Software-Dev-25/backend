@@ -170,7 +170,36 @@ fun Application.configureRouting() {
             call.respondText(Base64.getEncoder().encodeToString(encrypt.doFinal(token.toByteArray())))
         }
 
-        post("accounts/logout") {}
+        post("accounts/logout") {
+            val body: JsonObject
+            try {
+                val req = call.receive<String>()
+                println(req)
+                body = Parser.default().parse(StringBuilder(req)) as JsonObject
+                body.string("token")!!
+            } catch (e: Error) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val plaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
+            val token = plaintext[0]
+            val identifier = plaintext[1]
+
+            if (uniqueIdentifications.contains(identifier)) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            } else {
+                uniqueIdentifications += identifier
+            }
+
+            if (token in activeIdentifications) {
+                activeIdentifications.remove(token)
+                call.respond(HttpStatusCode.OK)
+            } else {
+                call.respond(HttpStatusCode.ExpectationFailed)
+            }
+        }
 
         post("accounts/delete") {}
     }

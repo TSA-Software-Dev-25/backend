@@ -57,4 +57,10 @@ suspend fun main() {
 //    var token: String? = null
 //    if (res.status.value == 200) token = String(decrypt.doFinal(Base64.getDecoder().decode(res.body<String>())))
 //    println(token)
+
+    // account logout
+//    val logout = HttpClient(CIO).post("http://localhost:8080/accounts/logout") {
+//        setBody("{\"token\": \"${Base64.getEncoder().encodeToString(cipher.doFinal("$token:ID=${SecureRandom().nextFloat().toString().sha256()}".toByteArray()))}\"}")
+//    }
+//    println(logout.status)
 }
