@@ -8,7 +8,9 @@ import io.ktor.client.HttpClient
 import io.ktor.client.call.*
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.request.bearerAuth
+import io.ktor.client.request.delete
 import io.ktor.client.request.get
+import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.http.*
@@ -25,6 +27,7 @@ import java.security.SecureRandom
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 import javax.crypto.Cipher
+import kotlin.time.TimeMark
 import kotlin.time.TimeSource
 
 fun String.sha256(): String {
@@ -201,6 +204,72 @@ fun Application.configureRouting() {
             }
         }
 
-        post("accounts/delete") {}
+        post("accounts/delete") {
+            val body: JsonObject
+            try {
+                val req = call.receive<String>()
+                println(req)
+                body = Parser.default().parse(StringBuilder(req)) as JsonObject
+                body.string("token")!!
+                body.string("password")!!
+            } catch (e: Error) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val tokenPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
+            val passwordPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("password")!!))).split(":ID=")
+            val token = tokenPlaintext[0]
+            val password = passwordPlaintext[0]
+            val identifier = tokenPlaintext[1]
+
+            if (tokenPlaintext[1] != passwordPlaintext[1] || uniqueIdentifications.contains(identifier) || token !in activeIdentifications) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            } else {
+                uniqueIdentifications += identifier
+            }
+
+            val time = (activeIdentifications[token]!![0] as TimeMark).elapsedNow()
+
+            if (time.inWholeHours > 3) {
+                activeIdentifications.remove(token)
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            }
+
+            val username = activeIdentifications[token]!![1] as String
+            activeIdentifications.remove(token)
+
+            var correct: Boolean? = null
+            val id: String?
+            runBlocking {
+                val res = HttpClient(CIO).get("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts?fields=Username&fields=Password&filterByFormula=%7BUsername%7D+%3D+'${URLEncoder.encode(username, "UTF-8")}'") {
+                    headers {
+                        bearerAuth(dotenv()["AIRTABLE_API_TOKEN"])
+                    }
+                }
+                val airtableCheckBody = Parser.default().parse(StringBuilder(res.body<String>())) as JsonObject
+                correct = airtableCheckBody.array<JsonObject>("records")?.get(0)?.obj("fields")?.string("Password") == password
+                id = airtableCheckBody.array<JsonObject>("records")?.get(0)?.string("id")
+            }
+            if (correct == null) {
+                call.respond(HttpStatusCode.Forbidden)
+                return@post
+            } else if (!correct) {
+                call.respond(HttpStatusCode.Forbidden)
+                return@post
+            }
+
+            runBlocking {
+                val res = HttpClient(CIO).delete("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts") {
+                    headers {
+                        bearerAuth(dotenv()["AIRTABLE_API_TOKEN"])
+                    }
+                    parameter("records[]", id)
+                }
+                call.respond(HttpStatusCode.fromValue(res.status.value))
+            }
+        }
     }
 }
