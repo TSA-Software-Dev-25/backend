@@ -30,10 +30,10 @@ suspend fun main() {
     cipher.init(Cipher.ENCRYPT_MODE, key)
 
     // account creation
-    val create = HttpClient(CIO).post("http://localhost:8080/accounts/create") {
-        setBody("{\"username\": \"admin\", \"password\": \"${Base64.getEncoder().encodeToString(cipher.doFinal("${"password".sha256()}:ID=${SecureRandom().nextFloat().toString().sha256()}".toByteArray()))}\"}")
-    }
-    println(create.status)
+//    val create = HttpClient(CIO).post("http://localhost:8080/accounts/create") {
+//        setBody("{\"username\": \"admin\", \"password\": \"${Base64.getEncoder().encodeToString(cipher.doFinal("${"password".sha256()}:ID=${SecureRandom().nextFloat().toString().sha256()}".toByteArray()))}\"}")
+//    }
+//    println(create.status)
 
     // account login
     val generator = KeyPairGenerator.getInstance("RSA")

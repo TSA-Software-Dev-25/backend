@@ -20,6 +20,7 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -347,11 +348,15 @@ fun Application.configureRouting() {
                     .addHeader("x-apikey", key)
                     .build()
                 val url = (Parser.default().parse(StringBuilder(client.newCall(urlRequest).execute().body()!!.string())) as JsonObject).string("data")!!
-                val postBody = RequestBody.create(MediaType.parse("multipart/form-data"), decoded)
+                val postBody = MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("file", "unknown", RequestBody.create(MediaType.parse("*/*"), decoded))
+                    .build()
                 val postRequest = Request.Builder()
                     .url(url)
                     .post(postBody)
                     .addHeader("accept", "application/json")
+                    .addHeader("content-type", "multipart/form-data")
                     .addHeader("x-apikey", key)
                     .build()
                 val analysesUrl = (Parser.default().parse(StringBuilder(client.newCall(postRequest).execute().body()!!.string())) as JsonObject).obj("data")!!.obj("links")!!.string("self")!!
@@ -362,7 +367,7 @@ fun Application.configureRouting() {
                     .addHeader("x-apikey", key)
                     .build()
                 val analyses = client.newCall(analysesRequest).execute().body()!!.string()
-                if ("\"malicious\": 0," !in body) {
+                if ("\"malicious\": 0," !in analyses) {
                     call.respond(HttpStatusCode.NotAcceptable)
                     return@runBlocking
                 } else {
