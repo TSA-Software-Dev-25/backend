@@ -35,6 +35,9 @@ dependencies {
     implementation("io.ktor:ktor-server-config-yaml")
     testImplementation("io.ktor:ktor-server-test-host-jvm")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.0.21")
+    implementation("io.ktor:ktor-client-logging")
+
+    implementation("com.squareup.okhttp3:okhttp:3.10.0")
 
     implementation("com.beust:klaxon:5.5")
     implementation("io.ktor:ktor-client-core:2.3.12")

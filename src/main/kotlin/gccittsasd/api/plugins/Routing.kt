@@ -19,6 +19,10 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.coroutines.runBlocking
+import okhttp3.MediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
 import java.net.URLEncoder
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
@@ -30,10 +34,14 @@ import javax.crypto.Cipher
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
 
-fun String.sha256(): String {
-    return return MessageDigest
+fun Any.sha256(): String {
+    var input = this
+    if (this !is ByteArray) {
+        input = this.toString().toByteArray()
+    }
+    return MessageDigest
         .getInstance("SHA-256")
-        .digest(this.toByteArray())
+        .digest(input)
         .fold("") { str, it -> str + "%02x".format(it) }
 }
 
@@ -46,6 +54,8 @@ fun Application.configureRouting() {
     val keyPair = generator.genKeyPair()
     val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
     cipher.init(Cipher.DECRYPT_MODE, keyPair.private)
+
+    val activelySending = mutableListOf<String>()
 
     routing {
         get("/key") {
@@ -60,7 +70,7 @@ fun Application.configureRouting() {
                 body = Parser.default().parse(StringBuilder(req)) as JsonObject
                 body.string("username")!!
                 body.string("password")!!
-            } catch (e: Error) {
+            } catch (_: Error) {
                 call.respond(HttpStatusCode.BadRequest)
                 return@post
             }
@@ -129,7 +139,7 @@ fun Application.configureRouting() {
                 body.string("username")!!
                 body.string("password")!!
                 body.string("key")!!
-            } catch (e: Error) {
+            } catch (_: Error) {
                 call.respond(HttpStatusCode.BadRequest)
                 return@post
             }
@@ -180,7 +190,7 @@ fun Application.configureRouting() {
                 println(req)
                 body = Parser.default().parse(StringBuilder(req)) as JsonObject
                 body.string("token")!!
-            } catch (e: Error) {
+            } catch (_: Error) {
                 call.respond(HttpStatusCode.BadRequest)
                 return@post
             }
@@ -212,7 +222,7 @@ fun Application.configureRouting() {
                 body = Parser.default().parse(StringBuilder(req)) as JsonObject
                 body.string("token")!!
                 body.string("password")!!
-            } catch (e: Error) {
+            } catch (_: Error) {
                 call.respond(HttpStatusCode.BadRequest)
                 return@post
             }
@@ -270,6 +280,101 @@ fun Application.configureRouting() {
                 }
                 call.respond(HttpStatusCode.fromValue(res.status.value))
             }
+        }
+
+        post("exchange/send") {
+            val body: JsonObject
+            try {
+                val req = call.receive<String>()
+                println(req)
+                body = Parser.default().parse(StringBuilder(req)) as JsonObject
+                body.string("token")!!
+                body.string("file")!!
+            } catch (_: Error) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val tokenPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
+            val identifier = tokenPlaintext[1]
+            val token = tokenPlaintext[0]
+            val file = body.string("file")!!
+
+            if (uniqueIdentifications.contains(identifier) || token !in activeIdentifications) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            } else {
+                uniqueIdentifications += identifier
+            }
+
+            val time = (activeIdentifications[token]!![0] as TimeMark).elapsedNow()
+
+            if (time.inWholeHours > 3) {
+                activeIdentifications.remove(token)
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            }
+
+            val decoded = Base64.getDecoder().decode(file)
+            val hash = decoded.sha256()
+
+            val key = dotenv()["VIRUSTOTAL_API_KEY"]
+            if (key.isNullOrEmpty()) {
+                throw Exception("Key is empty")
+            }
+            var passed: Boolean = false
+            runBlocking {
+                val client = OkHttpClient()
+                val request = Request.Builder()
+                    .url("https://www.virustotal.com/api/v3/files/$hash")
+                    .get()
+                    .addHeader("accept", "application/json")
+                    .addHeader("x-apikey", key)
+                    .build()
+                val response = client.newCall(request).execute()
+                val body = response.body()!!.string()
+                if ("NotFoundError" !in body && "\"malicious\": 0," !in body) {
+                    call.respond(HttpStatusCode.NotAcceptable)
+                    return@runBlocking
+                } else if ("NotFoundError" !in body) {
+                    passed = true
+                    return@runBlocking
+                }
+                val urlRequest = Request.Builder()
+                    .url("https://www.virustotal.com/api/v3/files/upload_url")
+                    .get()
+                    .addHeader("accept", "application/json")
+                    .addHeader("x-apikey", key)
+                    .build()
+                val url = (Parser.default().parse(StringBuilder(client.newCall(urlRequest).execute().body()!!.string())) as JsonObject).string("data")!!
+                val postBody = RequestBody.create(MediaType.parse("multipart/form-data"), decoded)
+                val postRequest = Request.Builder()
+                    .url(url)
+                    .post(postBody)
+                    .addHeader("accept", "application/json")
+                    .addHeader("x-apikey", key)
+                    .build()
+                val analysesUrl = (Parser.default().parse(StringBuilder(client.newCall(postRequest).execute().body()!!.string())) as JsonObject).obj("data")!!.obj("links")!!.string("self")!!
+                val analysesRequest = Request.Builder()
+                    .url(analysesUrl)
+                    .get()
+                    .addHeader("accept", "application/json")
+                    .addHeader("x-apikey", key)
+                    .build()
+                val analyses = client.newCall(analysesRequest).execute().body()!!.string()
+                if ("\"malicious\": 0," !in body) {
+                    call.respond(HttpStatusCode.NotAcceptable)
+                    return@runBlocking
+                } else {
+                    passed = true
+                    return@runBlocking
+                }
+            }
+            if (!passed) {
+                return@post
+            }
+            activelySending += file
+            call.respond(HttpStatusCode.OK)
         }
     }
 }
