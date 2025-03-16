@@ -57,6 +57,7 @@ fun Application.configureRouting() {
     cipher.init(Cipher.DECRYPT_MODE, keyPair.private)
 
     val activelySending = mutableListOf<String>()
+    val activelyReceiving = mutableListOf<Pair<String, String>>()
 
     routing {
         get("/key") {
@@ -380,6 +381,51 @@ fun Application.configureRouting() {
             }
             activelySending += file
             call.respond(HttpStatusCode.OK)
+        }
+
+        post("exchange/receive") {
+            val body: JsonObject
+            try {
+                val req = call.receive<String>()
+                println(req)
+                body = Parser.default().parse(StringBuilder(req)) as JsonObject
+                body.string("token")!!
+                body.int("load")!!
+                body.int("memory")!!
+            } catch (_: Error) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val tokenPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
+            val identifier = tokenPlaintext[1]
+            val token = tokenPlaintext[0]
+            val load = body.int("load")!!
+            val memory = body.int("memory")!!
+
+            if (uniqueIdentifications.contains(identifier) || token !in activeIdentifications) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            } else {
+                uniqueIdentifications += identifier
+            }
+
+            val time = (activeIdentifications[token]!![0] as TimeMark).elapsedNow()
+
+            if (time.inWholeHours > 3) {
+                activeIdentifications.remove(token)
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            }
+
+            if (activelySending.isEmpty()) {
+                call.respond(HttpStatusCode.NoContent)
+            }
+
+            val choice = activelySending.random()
+            activelySending -= choice
+            activelyReceiving += choice to activeIdentifications[token]!![1] as String
+            call.respondText(choice, ContentType.parse("application/vnd.microsoft.portable-executable"))
         }
     }
 }
