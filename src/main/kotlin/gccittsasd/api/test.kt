@@ -1,8 +1,12 @@
-import io.github.cdimascio.dotenv.dotenv
 import io.ktor.client.*
 import io.ktor.client.call.*
 import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.websocket.WebSockets
+import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.client.request.*
+import io.ktor.http.HttpMethod
+import io.ktor.websocket.Frame
+import io.ktor.websocket.readText
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
@@ -49,6 +53,7 @@ suspend fun main() {
     var token: String? = null
     if (login.status.value == 200) token = String(decrypt.doFinal(Base64.getDecoder().decode(login.body<String>())))
     println(token)
+    token ?: throw Exception("token not found")
 
     // account logout
 //    val logout = HttpClient(CIO).post("http://localhost:8080/accounts/logout") {
@@ -76,9 +81,22 @@ suspend fun main() {
     }
     println(fileSent.status)
 
-    // receive a file
-    val receive = HttpClient(CIO).post("http://localhost:8080/exchange/receive") {
-        setBody("{\"token\": \"${Base64.getEncoder().encodeToString(cipher.doFinal("$token:ID=${SecureRandom().nextFloat().toString().sha256()}".toByteArray()))}\", \"load\": 10, \"memory\": 8000000000}")
+    // connect to websocket
+    val websocket = HttpClient(CIO) {
+        install(WebSockets)
+    }.webSocket(
+        method = HttpMethod.Get,
+        host = "localhost",
+        port = 8080,
+        path = "/output"
+    ) {
+        while (true) {
+            val message = incoming.receive() as? Frame.Text
+                ?: continue
+            println(message.readText())
+            if (message.readText() == "token") {
+                send(Frame.Text(Base64.getEncoder().encodeToString(cipher.doFinal("$token:ID=${SecureRandom().nextFloat().toString().sha256()}".toByteArray()))))
+            }
+        }
     }
-    println(receive.body<String>())
 }

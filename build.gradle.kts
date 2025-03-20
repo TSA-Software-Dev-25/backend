@@ -36,6 +36,8 @@ dependencies {
     testImplementation("io.ktor:ktor-server-test-host-jvm")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.0.21")
     implementation("io.ktor:ktor-client-logging")
+    implementation("io.ktor:ktor-server-websockets")
+    implementation("io.ktor:ktor-client-websockets")
 
     implementation("com.squareup.okhttp3:okhttp:3.10.0")
 

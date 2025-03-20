@@ -18,6 +18,12 @@ import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import io.ktor.server.websocket.webSocket
+import io.ktor.websocket.CloseReason
+import io.ktor.websocket.Frame
+import io.ktor.websocket.close
+import io.ktor.websocket.readText
+import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType
 import okhttp3.MultipartBody
@@ -56,8 +62,9 @@ fun Application.configureRouting() {
     val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
     cipher.init(Cipher.DECRYPT_MODE, keyPair.private)
 
-    val activelySending = mutableListOf<String>()
-    val activelyReceiving = mutableListOf<Pair<String, String>>()
+    val activelySending = mutableMapOf<String, Pair<String, (() -> Unit)?>>()
+    val activelyReceiving = mutableMapOf<String, Pair<((String) -> Unit)?, String>>()
+    val nextFunction = mutableMapOf<String, ((String) -> Unit)?>()
 
     routing {
         get("/key") {
@@ -379,7 +386,7 @@ fun Application.configureRouting() {
             if (!passed) {
                 return@post
             }
-            activelySending += file
+            activelySending += token to (file to null)
             call.respond(HttpStatusCode.OK)
         }
 
@@ -422,10 +429,89 @@ fun Application.configureRouting() {
                 call.respond(HttpStatusCode.NoContent)
             }
 
-            val choice = activelySending.random()
+            val choice = activelySending.keys.random()
+            if (nextFunction[choice] != null) {
+                activelySending[choice]!!.second!!.invoke()
+                activelyReceiving += choice to (nextFunction[choice]!! to token)
+            } else {
+                activelyReceiving += choice to (null to token)
+            }
+            call.respondText(activelySending[choice]!!.first, ContentType.parse("application/x-python-code"))
             activelySending -= choice
-            activelyReceiving += choice to activeIdentifications[token]!![1] as String
-            call.respondText(choice, ContentType.parse("application/vnd.microsoft.portable-executable"))
+        }
+
+        post("exchange/finish") {
+            val body: JsonObject
+            try {
+                val req = call.receive<String>()
+                println(req)
+                body = Parser.default().parse(StringBuilder(req)) as JsonObject
+                body.string("token")!!
+                body.string("output")!!
+            } catch (_: Error) {
+                call.respond(HttpStatusCode.BadRequest)
+                return@post
+            }
+
+            val tokenPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
+            val identifier = tokenPlaintext[1]
+            val token = tokenPlaintext[0]
+            val output = body.string("output")!!
+
+            if (uniqueIdentifications.contains(identifier) || token !in activeIdentifications) {
+                call.respond(HttpStatusCode.Unauthorized)
+                return@post
+            } else {
+                uniqueIdentifications += identifier
+            }
+
+            for (i in activelyReceiving) {
+                if (i.value.second == token) {
+                    i.value.first?.invoke(output)
+                }
+            }
+        }
+
+        webSocket("/output") {
+            val ip = call.request.local.toString()
+            println(ip)
+            send(Frame.Text("token"))
+            incoming.consumeEach { frame ->
+                frame as? Frame.Text ?: return@consumeEach
+                val plain = String(cipher.doFinal(Base64.getDecoder().decode(frame.readText()))).split(":ID=")
+                val text = plain[0]
+                val ident = plain[1]
+                if (uniqueIdentifications.contains(ident)) {
+                    call.respond(HttpStatusCode.Unauthorized)
+                    return@consumeEach
+                } else {
+                    uniqueIdentifications += ident
+                }
+                if (text in activelySending) {
+                    send(Frame.Text("Waiting for receiver"))
+                    activelySending[text] = activelySending[text]!!.first to {
+                        runBlocking {
+                            send(Frame.Text("Waiting for execution to finish"))
+                        }
+                    }
+                    nextFunction[text] = { result ->
+                        runBlocking {
+                            send(Frame.Text(result))
+                            close(CloseReason(CloseReason.Codes.NORMAL, "Process finished"))
+                        }
+                    }
+                } else if (text in activelyReceiving) {
+                    send(Frame.Text("Waiting for execution to finish"))
+                    activelyReceiving[text] = { result: String ->
+                        runBlocking {
+                            send(Frame.Text(result))
+                            close(CloseReason(CloseReason.Codes.NORMAL, "Process finished"))
+                        }
+                    } to activelyReceiving[text]!!.second
+                } else {
+                    close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "Token not found"))
+                }
+            }
         }
     }
 }
