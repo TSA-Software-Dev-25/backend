@@ -1,5 +1,6 @@
 package gccittsasd.api.plugins
 
+// import necessary packages (kotlin uses a lot)
 import com.beust.klaxon.JsonObject
 import com.beust.klaxon.Klaxon
 import com.beust.klaxon.Parser
@@ -48,37 +49,44 @@ val gpuClients = ConcurrentHashMap<String, WebSocketSession>() // hashmap of tok
 val gpuData = ConcurrentHashMap<String, Float>() // hashmap of token to gpu data (in json)
 val gpuResponses = ConcurrentHashMap<String, String>()
 
+// function to sha256 hash anything
 fun Any.sha256(): String {
     var input = this
-    if (this !is ByteArray) {
+    if (this !is ByteArray) { // if the argument isnt a bytearray, make it one. this is necessary to run the digest function
         input = this.toString().toByteArray()
     }
     return MessageDigest
-        .getInstance("SHA-256")
+        .getInstance("SHA-256") // select sha256
         .digest(input)
-        .fold("") { str, it -> str + "%02x".format(it) }
+        .fold("") { str, it -> str + "%02x".format(it) } // add the text in a specific way
 }
 
+// api routing
 fun Application.configureRouting() {
-    val uniqueIdentifications = mutableListOf<String>()
-    val activeIdentifications = mutableMapOf<String, List<Any>>()
+    val uniqueIdentifications = mutableListOf<String>() // list of used identifications. this prevents piggybacking attacks on the rsa encryption
+    val activeIdentifications = mutableMapOf<String, List<Any>>() // list of logged in tokens and what they correspond to
 
+    // initialize rsa by creating a private and public key then making the cipher decryption method
     val generator = KeyPairGenerator.getInstance("RSA")
     generator.initialize(2048, SecureRandom())
     val keyPair = generator.genKeyPair()
     val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
     cipher.init(Cipher.DECRYPT_MODE, keyPair.private)
 
+    // keep lists of active files that are either ready to be or currently being received
     val activelySending = mutableMapOf<String, Pair<String, (() -> Unit)?>>()
     val activelyReceiving = mutableMapOf<String, Pair<((String) -> Unit)?, String>>()
-    val nextFunction = mutableMapOf<String, ((String) -> Unit)?>()
+    val nextFunction = mutableMapOf<String, ((String) -> Unit)?>() // simpler way of keeping track of the function for activelyReceiving before it comes into use
 
-    routing {
+    routing { // list of routes and functions to handle them
+        // return the public rsa key so users can encrypt messages and server can decrypt them
         get("/key") {
             call.respondText(Base64.getEncoder().encodeToString(keyPair.public.encoded), ContentType.parse("text/plain"))
         }
 
+        // call to create a new account in the database
         post("accounts/create") {
+            // check if post body has username and password fields
             val body: JsonObject
             try {
                 val req = call.receive<String>()
@@ -91,11 +99,13 @@ fun Application.configureRouting() {
                 return@post
             }
 
+            // decrypt password
             val username = body.string("username")!!
             val plaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("password")!!))).split(":ID=")
             val password = plaintext[0]
             val identifier = plaintext[1]
 
+            // check for valid identification
             if (uniqueIdentifications.contains(identifier)) {
                 call.respond(HttpStatusCode.Unauthorized)
                 return@post
@@ -103,24 +113,27 @@ fun Application.configureRouting() {
                 uniqueIdentifications += identifier
             }
 
+            // check if somebody is already registered with that username
             var unique: Boolean? = null
             runBlocking {
+                // make request to database looking for all records with same username
                 val res = HttpClient(CIO).get("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts?fields%5B%5D=Username&filterByFormula=%7BUsername%7D+%3D+'${URLEncoder.encode(username, "UTF-8")}'") {
                     headers {
                         bearerAuth(dotenv()["AIRTABLE_API_TOKEN"])
                     }
                 }
                 val airtableCheckBody = Parser.default().parse(StringBuilder(res.body<String>())) as JsonObject
-                unique = airtableCheckBody.array<JsonObject>("records")?.none()
+                unique = airtableCheckBody.array<JsonObject>("records")?.none() // true if there is no records returned
             }
-            if (unique == null) {
+            if (unique == null) { // shouldnt be possible but necessary for kotlin typecasting
                 call.respond(HttpStatusCode.InternalServerError)
                 return@post
             } else if (!unique) {
-                call.respond(HttpStatusCode.Forbidden)
+                call.respond(HttpStatusCode.Forbidden) // return 403 forbidden if its not a unique username
                 return@post
             }
 
+            // create record to append to
             val record = mapOf(
                 "records" to listOf(
                     mapOf(
@@ -134,6 +147,7 @@ fun Application.configureRouting() {
 
             val status: Int
             runBlocking {
+                // make request to database to add record
                 val res = HttpClient(CIO).post("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts") {
                     headers {
                         bearerAuth(dotenv()["AIRTABLE_API_TOKEN"])
@@ -143,10 +157,12 @@ fun Application.configureRouting() {
                 }
                 status = res.status.value
             }
-            if (status == 200) call.respond(HttpStatusCode.OK)
+            if (status == 200) call.respond(HttpStatusCode.OK) // if record was added well, return 200 OK
         }
 
+        // call to login to an existing account and receive a token to use in future calls
         post("accounts/login") {
+            // check if post body has username, password, and key fields
             val body: JsonObject
             try {
                 val req = call.receive<String>()
@@ -160,12 +176,14 @@ fun Application.configureRouting() {
                 return@post
             }
 
+            // decrypt password and generate rsa public key based on key parameter
             val username = body.string("username")!!
             val plaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("password")!!))).split(":ID=")
             val password = plaintext[0]
             val identifier = plaintext[1]
             val key = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(body.string("key")!!)))
 
+            // check identification
             if (uniqueIdentifications.contains(identifier)) {
                 call.respond(HttpStatusCode.Unauthorized)
                 return@post
@@ -173,6 +191,7 @@ fun Application.configureRouting() {
                 uniqueIdentifications += identifier
             }
 
+            // check if login information is correct
             var correct: Boolean? = null
             runBlocking {
                 val res = HttpClient(CIO).get("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts?fields=Username&fields=Password&filterByFormula=%7BUsername%7D+%3D+'${URLEncoder.encode(username, "UTF-8")}'") {
@@ -183,23 +202,31 @@ fun Application.configureRouting() {
                 val airtableCheckBody = Parser.default().parse(StringBuilder(res.body<String>())) as JsonObject
                 correct = airtableCheckBody.array<JsonObject>("records")?.get(0)?.obj("fields")?.string("Password") == password
             }
-            if (correct == null) {
+            if (correct == null) { // shouldnt be possible but necessary for kotlin typecasting
                 call.respond(HttpStatusCode.Forbidden)
                 return@post
-            } else if (!correct) {
+            } else if (!correct) { // separate if statement instead of || operator to allow typecasting
                 call.respond(HttpStatusCode.Forbidden)
                 return@post
             }
 
+            // make token from hash of securely random number and current time
+            // the token has no pattern at all so you would need to get the exact millisecond this line of code ran and check all floats between 0 and 1
+            // nobodys gonna do that, so its not vulnerable to predictable token attacks
             val token = "${SecureRandom().nextFloat()}:${System.currentTimeMillis()}".sha256()
-            activeIdentifications += token to listOf(TimeSource.Monotonic.markNow(), username)
+            activeIdentifications += token to listOf(TimeSource.Monotonic.markNow(), username) // time to check time elapsed and have a timeout point
 
+            // return the encrypted token so it cant be intercepted but user can still use it
             val encrypt = Cipher.getInstance("RSA/ECB/PKCS1Padding")
             encrypt.init(Cipher.ENCRYPT_MODE, key)
             call.respondText(Base64.getEncoder().encodeToString(encrypt.doFinal(token.toByteArray())))
         }
 
+        // call to logout of an account
+        // all thats required is a token because it cant break anything or mess with the user in any way so you can just delete the token from the list
+        // this is pretty much automatically run if a call is made over 3 hours from the login
         post("accounts/logout") {
+            // check for token parameter
             val body: JsonObject
             try {
                 val req = call.receive<String>()
@@ -211,10 +238,14 @@ fun Application.configureRouting() {
                 return@post
             }
 
+            // decrypt token
+            // probably unnecessary because it is being deleted anyway but the risk is:
+            // an attacker could intercept the request and stop it from going through and use the token themselves for something else
             val plaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
             val token = plaintext[0]
             val identifier = plaintext[1]
 
+            // check identification, also unnecessary since the request cant be run twice but might as well follow common structure
             if (uniqueIdentifications.contains(identifier)) {
                 call.respond(HttpStatusCode.Unauthorized)
                 return@post
@@ -222,6 +253,7 @@ fun Application.configureRouting() {
                 uniqueIdentifications += identifier
             }
 
+            // remove token from list or return an error if they werent logged in to begin with
             if (token in activeIdentifications) {
                 activeIdentifications.remove(token)
                 call.respond(HttpStatusCode.OK)
@@ -230,7 +262,9 @@ fun Application.configureRouting() {
             }
         }
 
+        // delete an account
         post("accounts/delete") {
+            // check for a token and password for additional verification
             val body: JsonObject
             try {
                 val req = call.receive<String>()
@@ -243,12 +277,14 @@ fun Application.configureRouting() {
                 return@post
             }
 
+            // decrypt both token and password
             val tokenPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
             val passwordPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("password")!!))).split(":ID=")
             val token = tokenPlaintext[0]
             val password = passwordPlaintext[0]
             val identifier = tokenPlaintext[1]
 
+            // check both identifications, which should also be the same identification but not used before
             if (tokenPlaintext[1] != passwordPlaintext[1] || uniqueIdentifications.contains(identifier) || token !in activeIdentifications) {
                 call.respond(HttpStatusCode.Unauthorized)
                 return@post
@@ -256,6 +292,7 @@ fun Application.configureRouting() {
                 uniqueIdentifications += identifier
             }
 
+            // check if more than 3 hours have elapsed and timeout the user if they have
             val time = (activeIdentifications[token]!![0] as TimeMark).elapsedNow()
 
             if (time.inWholeHours > 3) {
@@ -264,9 +301,11 @@ fun Application.configureRouting() {
                 return@post
             }
 
+            // remove token from logged in users, if its not logged in it will return an error anyway so nothing will be affected...
             val username = activeIdentifications[token]!![1] as String
             activeIdentifications.remove(token)
 
+            // check if password is correct
             var correct: Boolean? = null
             val id: String?
             runBlocking {
@@ -277,9 +316,9 @@ fun Application.configureRouting() {
                 }
                 val airtableCheckBody = Parser.default().parse(StringBuilder(res.body<String>())) as JsonObject
                 correct = airtableCheckBody.array<JsonObject>("records")?.get(0)?.obj("fields")?.string("Password") == password
-                id = airtableCheckBody.array<JsonObject>("records")?.get(0)?.string("id")
+                id = airtableCheckBody.array<JsonObject>("records")?.get(0)?.string("id") // get record id for deletion
             }
-            if (correct == null) {
+            if (correct == null) { // shouldnt be possible, but necessary for kotlin typecasting
                 call.respond(HttpStatusCode.Forbidden)
                 return@post
             } else if (!correct) {
@@ -287,6 +326,7 @@ fun Application.configureRouting() {
                 return@post
             }
 
+            // database call to remove account
             runBlocking {
                 val res = HttpClient(CIO).delete("https://api.airtable.com/v0/app5kgg3I15QSwFhT/Accounts") {
                     headers {
