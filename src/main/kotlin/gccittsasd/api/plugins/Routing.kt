@@ -19,12 +19,14 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.webSocket
-import io.ktor.websocket.CloseReason
-import io.ktor.websocket.Frame
-import io.ktor.websocket.close
-import io.ktor.websocket.readText
+import io.ktor.websocket.*
 import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.time.withTimeoutOrNull
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.*
 import okhttp3.MediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -37,9 +39,14 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
+
+val gpuClients = ConcurrentHashMap<String, WebSocketSession>() // hashmap of token to session
+val gpuData = ConcurrentHashMap<String, Float>() // hashmap of token to gpu data (in json)
+val gpuResponses = ConcurrentHashMap<String, String>()
 
 fun Any.sha256(): String {
     var input = this
@@ -291,227 +298,112 @@ fun Application.configureRouting() {
             }
         }
 
-        post("exchange/send") {
-            val body: JsonObject
+        post("exchange/forward") {
+            val (token, task) = try {
+                val req = call.receiveText()
+                val body = Json.parseToJsonElement(req).jsonObject
+                val token = body["token"]?.jsonPrimitive?.content
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, "Missing token")
+                val task = body["task"]?.jsonObject
+                    ?: return@post call.respond(HttpStatusCode.BadRequest, "Missing task object")
+                token to task
+            } catch (e: Exception) {
+                return@post call.respond(HttpStatusCode.BadRequest, "Invalid request")
+            }
+            println("obtained token and task")
+            println(task)
+            val bestGpu = gpuData.entries.maxByOrNull { it.value }
+            if (bestGpu == null) {
+                call.respond(HttpStatusCode.ExpectationFailed, "No GPU's available ")
+                return@post
+            }
+            println("found bestGpu")
+            println(bestGpu)
+            val gpuToken = bestGpu.key
+            val gpuSession = gpuClients[gpuToken]
+            if (gpuSession == null) {
+                call.respond(HttpStatusCode.ExpectationFailed, "GPU Client not available")
+                return@post
+            }
+            println("found gpu session")
+            println(gpuSession)
+            val taskPayload = task.toMutableMap().apply {
+                put("token", JsonPrimitive(token))
+            }
+            val jsonString = Json.encodeToString(taskPayload)
+            println(jsonString)
             try {
-                val req = call.receive<String>()
-                println(req)
-                body = Parser.default().parse(StringBuilder(req)) as JsonObject
-                body.string("token")!!
-                body.string("file")!!
+                gpuSession.send(Frame.Text(jsonString))
             } catch (_: Error) {
-                call.respond(HttpStatusCode.BadRequest)
+                call.respond(HttpStatusCode.ExpectationFailed, "Failed to forward task")
                 return@post
             }
-
-            val tokenPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
-            val identifier = tokenPlaintext[1]
-            val token = tokenPlaintext[0]
-            val file = body.string("file")!!
-
-            if (uniqueIdentifications.contains(identifier) || token !in activeIdentifications) {
-                call.respond(HttpStatusCode.Unauthorized)
-                return@post
-            } else {
-                uniqueIdentifications += identifier
-            }
-
-            val time = (activeIdentifications[token]!![0] as TimeMark).elapsedNow()
-
-            if (time.inWholeHours > 3) {
-                activeIdentifications.remove(token)
-                call.respond(HttpStatusCode.Unauthorized)
-                return@post
-            }
-
-            val decoded = Base64.getDecoder().decode(file)
-            val hash = decoded.sha256()
-
-            val key = dotenv()["VIRUSTOTAL_API_KEY"]
-            if (key.isNullOrEmpty()) {
-                throw Exception("Key is empty")
-            }
-            var passed: Boolean = false
-            runBlocking {
-                val client = OkHttpClient()
-                val request = Request.Builder()
-                    .url("https://www.virustotal.com/api/v3/files/$hash")
-                    .get()
-                    .addHeader("accept", "application/json")
-                    .addHeader("x-apikey", key)
-                    .build()
-                val response = client.newCall(request).execute()
-                val body = response.body()!!.string()
-                if ("NotFoundError" !in body && "\"malicious\": 0," !in body) {
-                    call.respond(HttpStatusCode.NotAcceptable)
-                    return@runBlocking
-                } else if ("NotFoundError" !in body) {
-                    passed = true
-                    return@runBlocking
-                }
-                val urlRequest = Request.Builder()
-                    .url("https://www.virustotal.com/api/v3/files/upload_url")
-                    .get()
-                    .addHeader("accept", "application/json")
-                    .addHeader("x-apikey", key)
-                    .build()
-                val url = (Parser.default().parse(StringBuilder(client.newCall(urlRequest).execute().body()!!.string())) as JsonObject).string("data")!!
-                val postBody = MultipartBody.Builder()
-                    .setType(MultipartBody.FORM)
-                    .addFormDataPart("file", "unknown", RequestBody.create(MediaType.parse("*/*"), decoded))
-                    .build()
-                val postRequest = Request.Builder()
-                    .url(url)
-                    .post(postBody)
-                    .addHeader("accept", "application/json")
-                    .addHeader("content-type", "multipart/form-data")
-                    .addHeader("x-apikey", key)
-                    .build()
-                val analysesUrl = (Parser.default().parse(StringBuilder(client.newCall(postRequest).execute().body()!!.string())) as JsonObject).obj("data")!!.obj("links")!!.string("self")!!
-                val analysesRequest = Request.Builder()
-                    .url(analysesUrl)
-                    .get()
-                    .addHeader("accept", "application/json")
-                    .addHeader("x-apikey", key)
-                    .build()
-                val analyses = client.newCall(analysesRequest).execute().body()!!.string()
-                if ("\"malicious\": 0," !in analyses) {
-                    call.respond(HttpStatusCode.NotAcceptable)
-                    return@runBlocking
-                } else {
-                    passed = true
-                    return@runBlocking
+            println("could send data")
+            val response = withTimeoutOrNull(30000) {
+                while (true) {
+                    println(token)
+                    val res = gpuResponses.remove(token)
+                    println(res)
+                    println(gpuResponses)
+                    if (res != null) {
+                        return@withTimeoutOrNull res
+                    }
+                    delay(100)
                 }
             }
-            if (!passed) {
-                return@post
-            }
-            activelySending += token to (file to null)
-            call.respond(HttpStatusCode.OK)
-        }
-
-        post("exchange/receive") {
-            val body: JsonObject
-            try {
-                val req = call.receive<String>()
-                println(req)
-                body = Parser.default().parse(StringBuilder(req)) as JsonObject
-                body.string("token")!!
-                body.int("load")!!
-                body.int("memory")!!
-            } catch (_: Error) {
-                call.respond(HttpStatusCode.BadRequest)
-                return@post
-            }
-
-            val tokenPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
-            val identifier = tokenPlaintext[1]
-            val token = tokenPlaintext[0]
-            val load = body.int("load")!!
-            val memory = body.int("memory")!!
-
-            if (uniqueIdentifications.contains(identifier) || token !in activeIdentifications) {
-                call.respond(HttpStatusCode.Unauthorized)
-                return@post
+            println("got a response: ")
+            println(response)
+            if (response == null) {
+                call.respond(HttpStatusCode.ExpectationFailed, "GPU Client did not respond in time")
             } else {
-                uniqueIdentifications += identifier
-            }
-
-            val time = (activeIdentifications[token]!![0] as TimeMark).elapsedNow()
-
-            if (time.inWholeHours > 3) {
-                activeIdentifications.remove(token)
-                call.respond(HttpStatusCode.Unauthorized)
-                return@post
-            }
-
-            if (activelySending.isEmpty()) {
-                call.respond(HttpStatusCode.NoContent)
-            }
-
-            val choice = activelySending.keys.random()
-            if (nextFunction[choice] != null) {
-                activelySending[choice]!!.second!!.invoke()
-                activelyReceiving += choice to (nextFunction[choice]!! to token)
-            } else {
-                activelyReceiving += choice to (null to token)
-            }
-            call.respondText(activelySending[choice]!!.first, ContentType.parse("application/x-python-code"))
-            activelySending -= choice
-        }
-
-        post("exchange/finish") {
-            val body: JsonObject
-            try {
-                val req = call.receive<String>()
-                println(req)
-                body = Parser.default().parse(StringBuilder(req)) as JsonObject
-                body.string("token")!!
-                body.string("output")!!
-            } catch (_: Error) {
-                call.respond(HttpStatusCode.BadRequest)
-                return@post
-            }
-
-            val tokenPlaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("token")!!))).split(":ID=")
-            val identifier = tokenPlaintext[1]
-            val token = tokenPlaintext[0]
-            val output = body.string("output")!!
-
-            if (uniqueIdentifications.contains(identifier) || token !in activeIdentifications) {
-                call.respond(HttpStatusCode.Unauthorized)
-                return@post
-            } else {
-                uniqueIdentifications += identifier
-            }
-
-            for (i in activelyReceiving) {
-                if (i.value.second == token) {
-                    i.value.first?.invoke(output)
-                }
+                val responseBody = Json.parseToJsonElement(response.toString()).jsonObject
+                println(responseBody)
+                call.respondText(response.toString(), ContentType.Application.Json)
             }
         }
 
-        webSocket("/output") {
-            val ip = call.request.local.toString()
-            println(ip)
-            send(Frame.Text("token"))
-            incoming.consumeEach { frame ->
-                frame as? Frame.Text ?: return@consumeEach
-                val plain = String(cipher.doFinal(Base64.getDecoder().decode(frame.readText()))).split(":ID=")
-                val text = plain[0]
-                val ident = plain[1]
-                if (uniqueIdentifications.contains(ident)) {
-                    call.respond(HttpStatusCode.Unauthorized)
-                    return@consumeEach
-                } else {
-                    uniqueIdentifications += ident
-                }
-                if (text in activelySending) {
-                    send(Frame.Text("Waiting for receiver"))
-                    activelySending[text] = activelySending[text]!!.first to {
-                        runBlocking {
-                            send(Frame.Text("Waiting for execution to finish"))
+        webSocket("exchange/connect") {
+            val session = this
+            val message = incoming.receive() as? Frame.Text ?: return@webSocket
+            val body = Json.parseToJsonElement(message.readText()).jsonObject
+            val token = body["token"]?.jsonPrimitive?.content ?: return@webSocket
+            val gpus = body["memory"]?.jsonPrimitive?.floatOrNull ?: return@webSocket
+
+            gpuClients[token] = session
+            gpuData[token] = gpus
+            println(gpuData)
+            println(gpuClients)
+            while (true) {
+                val frame = withTimeoutOrNull(31 * 60 * 1000) {incoming.receive()} ?: break
+                when (frame) {
+                    is Frame.Text -> {
+                        // Parse the incoming frame as a JSON object
+                        val frameJson = Json.parseToJsonElement(frame.readText()).jsonObject
+                        println(frameJson)
+                        val output = frameJson["output"]
+                        println(output)
+
+                        if (output != null && output.toString() != "0") {
+                            val forwardingToken = frameJson["forwarding_token"]?.jsonPrimitive?.content
+                            println(forwardingToken)
+                            if (forwardingToken != null) {
+                                gpuResponses[forwardingToken.toString()] = output.toString()
+                                println("gpu responses:")
+                                println(gpuResponses)
+                            }
+                        } else {
+                            val updatedGpus = frameJson["memory"]?.jsonPrimitive?.floatOrNull
+                                ?: break
+                            gpuData[token] = updatedGpus
                         }
                     }
-                    nextFunction[text] = { result ->
-                        runBlocking {
-                            send(Frame.Text(result))
-                            close(CloseReason(CloseReason.Codes.NORMAL, "Process finished"))
-                        }
-                    }
-                } else if (text in activelyReceiving) {
-                    send(Frame.Text("Waiting for execution to finish"))
-                    activelyReceiving[text] = { result: String ->
-                        runBlocking {
-                            send(Frame.Text(result))
-                            close(CloseReason(CloseReason.Codes.NORMAL, "Process finished"))
-                        }
-                    } to activelyReceiving[text]!!.second
-                } else {
-                    close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "Token not found"))
+                    is Frame.Close -> break
+                    else -> Unit
                 }
             }
+            gpuClients.remove(token)
+            gpuData.remove(token)
+            println("Connection closed successfully")
         }
     }
 }
