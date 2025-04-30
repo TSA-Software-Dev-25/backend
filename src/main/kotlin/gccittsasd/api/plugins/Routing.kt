@@ -70,7 +70,7 @@ fun Application.configureRouting() {
     val generator = KeyPairGenerator.getInstance("RSA")
     generator.initialize(2048, SecureRandom())
     val keyPair = generator.genKeyPair()
-    val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+    val cipher = Cipher.getInstance("RSA/ECB/OAEPPadding")
     cipher.init(Cipher.DECRYPT_MODE, keyPair.private)
 
     // keep lists of active files that are either ready to be or currently being received
@@ -217,7 +217,7 @@ fun Application.configureRouting() {
             activeIdentifications += token to listOf(TimeSource.Monotonic.markNow(), username) // time to check time elapsed and have a timeout point
 
             // return the encrypted token so it cant be intercepted but user can still use it
-            val encrypt = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+            val encrypt = Cipher.getInstance("RSA/ECB/OAEPPadding")
             encrypt.init(Cipher.ENCRYPT_MODE, key)
             call.respondText(Base64.getEncoder().encodeToString(encrypt.doFinal(token.toByteArray())))
         }

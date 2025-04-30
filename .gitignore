@@ -4,7 +4,7 @@ gradle/wrapper
 !**/src/main/**/build/
 !**/src/test/**/build/
 gradle.properties
-.env
+../.env
 
 ### IntelliJ IDEA ###
 .idea
