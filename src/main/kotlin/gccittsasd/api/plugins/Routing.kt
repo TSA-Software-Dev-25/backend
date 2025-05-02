@@ -109,8 +109,6 @@ fun Application.configureRouting() {
             if (uniqueIdentifications.contains(identifier)) {
                 call.respond(HttpStatusCode.Unauthorized)
                 return@post
-            } else {
-                uniqueIdentifications += identifier
             }
 
             // check if somebody is already registered with that username
