@@ -60,6 +60,7 @@ fun Any.sha256(): String {
         .digest(input)
         .fold("") { str, it -> str + "%02x".format(it) } // add the text in a specific way
 }
+//comment
 
 // api routing
 fun Application.configureRouting() {
