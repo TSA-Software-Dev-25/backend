@@ -21,14 +21,14 @@ suspend fun main() {
     val keyRes = HttpClient(CIO).get("http://localhost:8080/key")
     val spec = X509EncodedKeySpec(Base64.getDecoder().decode(keyRes.body<String>()))
     val key = KeyFactory.getInstance("RSA").generatePublic(spec)
-    val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+    val cipher = Cipher.getInstance("RSA/ECB/OAEPPadding")
     cipher.init(Cipher.ENCRYPT_MODE, key)
 
     // account login
     val generator = KeyPairGenerator.getInstance("RSA")
     generator.initialize(2048, SecureRandom())
     val keyPair = generator.genKeyPair()
-    val decrypt = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+    val decrypt = Cipher.getInstance("RSA/ECB/OAEPPadding")
     decrypt.init(Cipher.DECRYPT_MODE, keyPair.private)
 
     val login = HttpClient(CIO).post("http://localhost:8080/accounts/login") {
@@ -41,7 +41,7 @@ suspend fun main() {
     token ?: throw Exception("token not found")
 
     // receive a file
-    val receive = HttpClient(CIO).post("http://localhost:8080/exchange/receive") {
+    val receive = HttpClient(CIO).post("http://localhost:8080/exchange/connect") {
         setBody("{\"token\": \"${Base64.getEncoder().encodeToString(cipher.doFinal("$token:ID=${SecureRandom().nextFloat().toString().sha256()}".toByteArray()))}\", \"load\": 10, \"memory\": 8000000000}")
     }
     println(receive.status)

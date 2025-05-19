@@ -16,6 +16,7 @@ import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.http.*
 import io.ktor.server.application.*
+import io.ktor.server.http.content.file
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -180,7 +181,7 @@ fun Application.configureRouting() {
             val plaintext = String(cipher.doFinal(Base64.getDecoder().decode(body.string("password")!!))).split(":ID=")
             val password = plaintext[0]
             val identifier = plaintext[1]
-            val key = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(body.string("key")!!)))
+            val key = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(body.string("key")!!.replace("\r", ""))))
 
             // check identification
             if (uniqueIdentifications.contains(identifier)) {
@@ -347,10 +348,82 @@ fun Application.configureRouting() {
                     ?: return@post call.respond(HttpStatusCode.BadRequest, "Missing task object")
                 token to task
             } catch (e: Exception) {
-                return@post call.respond(HttpStatusCode.BadRequest, "Invalid request")
+                return@post call.respond(HttpStatusCode.BadRequest, "Invalid request $e")
             }
             println("obtained token and task")
             println(task)
+            // decode and get hash of file
+            val decoded = Base64.getDecoder().decode(task.toMap()["file_content"].toString().replace("\"", ""))
+            val hash = decoded.sha256()
+            // get virus total key from .env variables and check it
+            val key = dotenv()["VIRUSTOTAL_API_KEY"]
+            if (key.isNullOrEmpty()) {
+                throw Exception("Key is empty")
+            }
+            var passed: Boolean = false // will be used later (line 433)
+            runBlocking {
+                // check if there is already a report for the file based on the hash
+                val client = OkHttpClient()
+                val request = Request.Builder()
+                    .url("https://www.virustotal.com/api/v3/files/$hash")
+                    .get()
+                    .addHeader("accept", "application/json")
+                    .addHeader("x-apikey", key)
+                    .build()
+                val response = client.newCall(request).execute()
+                val body = response.body()!!.string()
+                // check if file is either not found or malicious and respond accordingly
+                if ("NotFoundError" !in body && "\"malicious\": 0," !in body) {
+                    call.respond(HttpStatusCode.NotAcceptable)
+                    println("malicous, blocking")
+                    return@runBlocking
+                } else if ("NotFoundError" !in body) {
+                    passed = true
+                    println("previous scan showed no malware, passed")
+                    return@runBlocking
+                }
+                // get a new url for uploading larger files
+                val urlRequest = Request.Builder()
+                    .url("https://www.virustotal.com/api/v3/files/upload_url")
+                    .get()
+                    .addHeader("accept", "application/json")
+                    .addHeader("x-apikey", key)
+                    .build()
+                val url = (Parser.default().parse(StringBuilder(client.newCall(urlRequest).execute().body()!!.string())) as JsonObject).string("data")!!
+                // get url of the report for the file
+                val postBody = MultipartBody.Builder() // create the body as a multipart form
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("file", "unknown", RequestBody.create(MediaType.parse("*/*"), decoded))
+                    .build()
+                val postRequest = Request.Builder()
+                    .url(url)
+                    .post(postBody)
+                    .addHeader("accept", "application/json")
+                    .addHeader("content-type", "multipart/form-data")
+                    .addHeader("x-apikey", key)
+                    .build()
+                val analysesUrl = (Parser.default().parse(StringBuilder(client.newCall(postRequest).execute().body()!!.string())) as JsonObject).obj("data")!!.obj("links")!!.string("self")!!
+                // check the report on the file
+                val analysesRequest = Request.Builder() // btw virustotal does actually spell analysis "analyses" for some reason
+                    .url(analysesUrl)
+                    .get()
+                    .addHeader("accept", "application/json")
+                    .addHeader("x-apikey", key)
+                    .build()
+                val analyses = client.newCall(analysesRequest).execute().body()!!.string()
+                if ("\"malicious\": 0," !in analyses) { // analyze the analysis
+                    call.respond(HttpStatusCode.NotAcceptable)
+                    println("scan found malware, blocking")
+                    return@runBlocking
+                } else {
+                    passed = true
+                    println("scan found no malware, passed")
+                    return@runBlocking
+                }
+            }
+            if (!passed) { // end lambda before adding the file if it didnt pass
+                return@post
+            }
             val bestGpu = gpuData.entries.maxByOrNull { it.value }
             if (bestGpu == null) {
                 call.respond(HttpStatusCode.ExpectationFailed, "No GPU's available ")
