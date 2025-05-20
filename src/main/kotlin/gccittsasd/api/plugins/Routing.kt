@@ -16,16 +16,13 @@ import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.http.*
 import io.ktor.server.application.*
-import io.ktor.server.http.content.file
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.webSocket
 import io.ktor.websocket.*
-import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.time.withTimeoutOrNull
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
@@ -48,7 +45,7 @@ import kotlin.time.TimeSource
 
 val gpuClients = ConcurrentHashMap<String, WebSocketSession>() // hashmap of token to session
 val gpuData = ConcurrentHashMap<String, Float>() // hashmap of token to gpu data (in json)
-val gpuResponses = ConcurrentHashMap<String, String>()
+val gpuResponses = ConcurrentHashMap<String, String>() // hashmap of token to output
 
 // function to sha256 hash anything
 fun Any.sha256(): String {
@@ -61,7 +58,6 @@ fun Any.sha256(): String {
         .digest(input)
         .fold("") { str, it -> str + "%02x".format(it) } // add the text in a specific way
 }
-//comment
 
 // api routing
 fun Application.configureRouting() {
@@ -70,15 +66,10 @@ fun Application.configureRouting() {
 
     // initialize rsa by creating a private and public key then making the cipher decryption method
     val generator = KeyPairGenerator.getInstance("RSA")
-    generator.initialize(2048, SecureRandom())
+    generator.initialize(2048, SecureRandom()) // sets keysize to 2048 bits and gives a secure constructor to provide random numbers
     val keyPair = generator.genKeyPair()
-    val cipher = Cipher.getInstance("RSA/ECB/OAEPPadding")
+    val cipher = Cipher.getInstance("RSA/ECB/OAEPPadding") // set OAEP padding for compatibility with node js encryption
     cipher.init(Cipher.DECRYPT_MODE, keyPair.private)
-
-    // keep lists of active files that are either ready to be or currently being received
-    val activelySending = mutableMapOf<String, Pair<String, (() -> Unit)?>>()
-    val activelyReceiving = mutableMapOf<String, Pair<((String) -> Unit)?, String>>()
-    val nextFunction = mutableMapOf<String, ((String) -> Unit)?>() // simpler way of keeping track of the function for activelyReceiving before it comes into use
 
     routing { // list of routes and functions to handle them
         // return the public rsa key so users can encrypt messages and server can decrypt them
@@ -88,7 +79,7 @@ fun Application.configureRouting() {
 
         // call to create a new account in the database
         post("accounts/create") {
-            // check if post body has username and password fields
+            // check if post body has required fields
             val body: JsonObject
             try {
                 val req = call.receive<String>()
@@ -338,9 +329,12 @@ fun Application.configureRouting() {
             }
         }
 
+        // send in a file
         post("exchange/forward") {
+            // get token and task
             val (token, task) = try {
                 val req = call.receiveText()
+                // used different ways of parsing json
                 val body = Json.parseToJsonElement(req).jsonObject
                 val token = body["token"]?.jsonPrimitive?.content
                     ?: return@post call.respond(HttpStatusCode.BadRequest, "Missing token")
@@ -424,16 +418,17 @@ fun Application.configureRouting() {
             if (!passed) { // end lambda before adding the file if it didnt pass
                 return@post
             }
+            // get best available gpu
             val bestGpu = gpuData.entries.maxByOrNull { it.value }
-            if (bestGpu == null) {
-                call.respond(HttpStatusCode.ExpectationFailed, "No GPU's available ")
+            if (bestGpu == null) { // if there is no gpus
+                call.respond(HttpStatusCode.ExpectationFailed, "No GPU's available") // respond with that
                 return@post
             }
             println("found bestGpu")
             println(bestGpu)
             val gpuToken = bestGpu.key
             val gpuSession = gpuClients[gpuToken]
-            if (gpuSession == null) {
+            if (gpuSession == null) { // happens if client exits program early
                 call.respond(HttpStatusCode.ExpectationFailed, "GPU Client not available")
                 return@post
             }
@@ -445,13 +440,14 @@ fun Application.configureRouting() {
             val jsonString = Json.encodeToString(taskPayload)
             println(jsonString)
             try {
-                gpuSession.send(Frame.Text(jsonString))
+                gpuSession.send(Frame.Text(jsonString)) // send the task to the runner
             } catch (_: Error) {
-                call.respond(HttpStatusCode.ExpectationFailed, "Failed to forward task")
+                call.respond(HttpStatusCode.ExpectationFailed, "Failed to forward task") // selected runner is actively disconnecting most likely
                 return@post
             }
             println("could send data")
-            val response = withTimeoutOrNull(30000) {
+            // wait to get response from runner
+            val response = withTimeoutOrNull(30000) { // value can and should be changed if running large scale production, but for basic http its fine
                 while (true) {
                     println(token)
                     val res = gpuResponses.remove(token)
@@ -465,29 +461,30 @@ fun Application.configureRouting() {
             }
             println("got a response: ")
             println(response)
-            if (response == null) {
+            if (response == null) { // if no response was received
                 call.respond(HttpStatusCode.ExpectationFailed, "GPU Client did not respond in time")
             } else {
                 val responseBody = Json.parseToJsonElement(response.toString()).jsonObject
                 println(responseBody)
-                call.respondText(response.toString(), ContentType.Application.Json)
+                call.respondText(response.toString(), ContentType.Application.Json) // give the response back
             }
         }
 
+        // runner connect method
         webSocket("exchange/connect") {
-            val session = this
-            val message = incoming.receive() as? Frame.Text ?: return@webSocket
+            val session = this // used later
+            val message = incoming.receive() as? Frame.Text ?: return@webSocket // initialize connection with runner info
             val body = Json.parseToJsonElement(message.readText()).jsonObject
             val token = body["token"]?.jsonPrimitive?.content ?: return@webSocket
             val gpus = body["memory"]?.jsonPrimitive?.floatOrNull ?: return@webSocket
 
-            gpuClients[token] = session
-            gpuData[token] = gpus
+            gpuClients[token] = session // gives access to internal functions from other request handlers
+            gpuData[token] = gpus // stores gpu data
             println(gpuData)
             println(gpuClients)
             while (true) {
-                val frame = withTimeoutOrNull(31 * 60 * 1000) {incoming.receive()} ?: break
-                when (frame) {
+                val frame = withTimeoutOrNull(31 * 60 * 1000) {incoming.receive()} ?: break // get frame
+                when (frame) { // different handlers for different types of content received
                     is Frame.Text -> {
                         // Parse the incoming frame as a JSON object
                         val frameJson = Json.parseToJsonElement(frame.readText()).jsonObject
@@ -495,24 +492,25 @@ fun Application.configureRouting() {
                         val output = frameJson["output"]
                         println(output)
 
-                        if (output != null && output.toString() != "0") {
+                        if (output != null && output.toString() != "0") { // if there is an output
                             val forwardingToken = frameJson["forwarding_token"]?.jsonPrimitive?.content
                             println(forwardingToken)
                             if (forwardingToken != null) {
-                                gpuResponses[forwardingToken.toString()] = output.toString()
+                                gpuResponses[forwardingToken.toString()] = output.toString() // add it to responses
                                 println("gpu responses:")
                                 println(gpuResponses)
                             }
                         } else {
-                            val updatedGpus = frameJson["memory"]?.jsonPrimitive?.floatOrNull
+                            val updatedGpus = frameJson["memory"]?.jsonPrimitive?.floatOrNull // gets vram again to update system info
                                 ?: break
                             gpuData[token] = updatedGpus
                         }
                     }
-                    is Frame.Close -> break
-                    else -> Unit
+                    is Frame.Close -> break // ends script if connection closed
+                    else -> Unit // nothing happened this frame
                 }
             }
+            // remove info after script is done
             gpuClients.remove(token)
             gpuData.remove(token)
             println("Connection closed successfully")
